@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>NemuriBeat</string>
+<key>CFBundleDisplayName</key><string>NemuriBeat</string>
+<key>CFBundleIdentifier</key><string>dev.vrc-health-check.nemuribeat</string>
+<key>CFBundleIconFile</key><string>NemuriBeat.icns</string>
+<key>CFBundleExecutable</key><string>nemuribeat</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>NSBluetoothAlwaysUsageDescription</key><string>Connect to your selected heart rate sensor to record heart rate and RR intervals.</string>
+<key>NSBluetoothPeripheralUsageDescription</key><string>Connect to your selected heart rate sensor to record heart rate and RR intervals.</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>

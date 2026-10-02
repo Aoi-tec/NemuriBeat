@@ -1,0 +1,11 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shared-types = { path = "../shared-types" }
+anyhow.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+serde.workspace = true

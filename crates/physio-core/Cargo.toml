@@ -1,0 +1,8 @@
+[package]
+name = "physio-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shared-types = { path = "../shared-types" }
+tokio.workspace = true

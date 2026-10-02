@@ -1,0 +1,14 @@
+[package]
+name = "sensor-ble"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sensor-core = { path = "../sensor-core" }
+shared-types = { path = "../shared-types" }
+tokio.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+btleplug = "0.11"
+futures = "0.3"

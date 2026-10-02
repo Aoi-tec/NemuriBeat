@@ -1,0 +1,10 @@
+[package]
+name = "sensor-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shared-types = { path = "../shared-types" }
+async-trait.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
