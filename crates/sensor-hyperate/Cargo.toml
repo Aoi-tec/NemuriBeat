@@ -1,5 +1,5 @@
 [package]
-name = "sensor-pulsoid"
+name = "sensor-hyperate"
 version.workspace = true
 edition.workspace = true
 [dependencies]
@@ -13,4 +13,3 @@ serde_json.workspace = true
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 url = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

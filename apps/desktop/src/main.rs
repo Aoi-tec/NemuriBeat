@@ -1,6 +1,9 @@
+mod oyasumi;
 mod paths;
 mod plot;
+mod resident;
 mod runtime;
+mod sleep_workers;
 mod theme;
 mod ui;
 mod widgets;
@@ -20,7 +23,7 @@ fn main() -> Result<()> {
         .init();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help") {
-        println!("nemuribeat [--demo] [--demo-hr-only] [--demo-sleep] [--headless] [--seconds N] [--data-dir PATH] [--api] [--ipc PATH] [--pulsoid]\nDefault: native GUI; select a BLE sensor in Sensors. Demo uses a separate database.");
+        println!("nemuribeat [--demo] [--demo-hr-only] [--demo-sleep] [--headless] [--seconds N] [--data-dir PATH] [--api] [--ipc PATH] [--hyperate] [--start-hidden]\nDefault: native GUI; select a BLE sensor in Sensors. Demo uses a separate database.");
         return Ok(());
     }
     let value = |key: &str| {
@@ -83,9 +86,13 @@ fn main() -> Result<()> {
     let mut gui_error = None;
     if headless {
         rt.block_on(async {
-            if args.iter().any(|a| a == "--pulsoid") {
-                let token = std::env::var("PULSOID_ACCESS_TOKEN").unwrap_or_default();
-                let _ = commands.send(runtime::Command::ConnectPulsoid(token)).await;
+            if args.iter().any(|a| a == "--hyperate") {
+                let key = std::env::var("HYPERATE_API_KEY").unwrap_or_default();
+                let id =
+                    std::env::var("HYPERATE_ID").unwrap_or_else(|_| settings.hyperate_id.clone());
+                let _ = commands
+                    .send(runtime::Command::ConnectHypeRate { id, key })
+                    .await;
             }
             if let Some(seconds) = seconds {
                 tokio::time::sleep(Duration::from_secs(seconds)).await;
@@ -94,7 +101,7 @@ fn main() -> Result<()> {
             }
         });
     } else {
-        let app = ui::Desktop::new(
+        let mut app = ui::Desktop::new(
             core.clone(),
             storage.health.clone(),
             shared,
@@ -103,6 +110,7 @@ fn main() -> Result<()> {
             demo,
             dir.display().to_string(),
         );
+        app.start_hidden(args.iter().any(|a| a == "--start-hidden"));
         let options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_icon(app_icon()?)

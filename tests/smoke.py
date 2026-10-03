@@ -1,4 +1,4 @@
-"""Offline full-runtime checks for HR+RR recording and HR-only output. No Pulsoid token required."""
+"""Offline full-runtime checks for HR+RR recording and HR-only output. No HypeRate API key required."""
 import concurrent.futures
 import json
 import os
@@ -55,7 +55,7 @@ def scenario(hr_only):
                     if process.poll() is not None or time.monotonic() > deadline:
                         raise
                     time.sleep(0.1)
-            assert "pulsoid_token" not in get("/settings")
+            assert "hyperate_key" not in get("/settings")
             assert get("/sleep/sessions") == [], "Recording must not begin at application startup"
             assert osc.recv(4096).startswith(b"/avatar/parameters/VRCOSC/")
             if os.name == "posix":

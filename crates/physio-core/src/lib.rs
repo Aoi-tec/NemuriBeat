@@ -51,6 +51,7 @@ impl RealtimeCore {
             s.source_timestamp = None;
             s.signal_quality = 0.0;
             s.sleep = SleepEstimate::default();
+            s.sleep_model = ModelStatus::default();
             s.heart_rate = None;
             s.heart_rate_average = None;
             s.last_rr_ms = None;
@@ -147,6 +148,12 @@ impl RealtimeCore {
             s.sleep = sleep.clone();
         });
         let _ = self.events.send(Event::SleepProbabilityChanged(sleep));
+    }
+    pub fn set_sleep_context(&self, model: ModelStatus, hmd: HmdStatus) {
+        self.snapshot.send_modify(|s| {
+            s.sleep_model = model;
+            s.hmd = hmd;
+        });
     }
     pub fn expire(&self, now: i64) -> bool {
         let s = self.latest();

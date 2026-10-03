@@ -49,6 +49,8 @@ pub struct Desktop {
     /// 編集中の設定。「適用して保存」で `saved` になる。
     settings: Settings,
     brand: Option<egui::TextureHandle>,
+    hyperate_key: String,
+    resident: crate::resident::Resident,
     /// いま動いている設定。
     saved: Settings,
     osc_port: String,
@@ -89,6 +91,8 @@ impl Desktop {
             saved: settings.clone(),
             settings,
             brand: None,
+            hyperate_key: String::new(),
+            resident: Default::default(),
             page: Page::Dashboard,
             demo,
             notice: String::new(),
@@ -100,6 +104,10 @@ impl Desktop {
             reloaded_at: 0.0,
             theme: egui::ThemePreference::Dark,
         }
+    }
+
+    pub fn start_hidden(&mut self, value: bool) {
+        self.resident.start_hidden(value);
     }
 
     fn command(&mut self, c: Command) -> bool {
@@ -170,16 +178,11 @@ impl Desktop {
 
     /// 表示するセッション: 選んだもの、なければ記録中、なければ最新。
     fn shown_session<'a>(&self, v: &'a View) -> Option<&'a SleepSession> {
-        let by_id = |id: &String| {
-            v.active
-                .iter()
-                .chain(v.sessions.iter())
-                .find(|t| &t.session_id == id)
-        };
+        let by_id = |id: &String| v.sessions.iter().find(|t| &t.session_id == id);
         self.session
             .as_ref()
             .and_then(by_id)
-            .or(v.active.as_ref())
+            .or_else(|| v.sessions.iter().find(|t| day_is_active(v, &t.session_id)))
             .or(v.sessions.first())
     }
 
@@ -189,7 +192,7 @@ impl Desktop {
             return;
         };
         let now = ctx.input(|i| i.time);
-        let recording = v.active.as_ref().is_some_and(|t| t.session_id == id);
+        let recording = day_is_active(v, &id);
         let stale = recording && now - self.reloaded_at > 60.0;
         if (self.requested.as_ref() != Some(&id) || stale)
             && self.command(Command::SelectSession(id.clone()))
@@ -460,7 +463,7 @@ impl Desktop {
                 ui,
                 "睡眠 / 覚醒の推定",
                 |ui| {
-                    ui.label(muted(ui, night_label(t.started_at)));
+                    ui.label(muted(ui, sleep_day_label(t)));
                 },
                 |ui| {
                     if minutes.is_empty() {
@@ -516,7 +519,7 @@ impl Desktop {
                 go = newer.clone();
             }
             if let Some(t) = &session {
-                ui.label(night_label(t.started_at));
+                ui.label(sleep_day_label(t));
             }
             if step(ui, "‹", &older) {
                 go = older.clone();
@@ -552,11 +555,7 @@ impl Desktop {
             let (h, m) = hours_minutes(t.estimated_sleep_minutes);
             let state = if t.ended_at.is_some() {
                 "完了"
-            } else if v
-                .active
-                .as_ref()
-                .is_some_and(|a| a.session_id == t.session_id)
-            {
+            } else if day_is_active(v, &t.session_id) {
                 "記録中"
             } else {
                 "中断"
@@ -610,7 +609,18 @@ impl Desktop {
             ui,
             "睡眠 / 覚醒の推定",
             |ui| {
-                ui.label(muted(ui, format!("{} 分ぶんの記録", minutes.len())));
+                let segments = v
+                    .days
+                    .iter()
+                    .find(|d| d.summary.session_id == t.session_id)
+                    .map_or(1, |d| d.segments.len());
+                ui.label(muted(
+                    ui,
+                    format!(
+                        "{segments} 区間を日単位に集約 · {} 分ぶんの記録（欠測は除外）",
+                        minutes.len()
+                    ),
+                ));
             },
             |ui| {
                 if minutes.is_empty() {
@@ -712,7 +722,7 @@ impl Desktop {
         widgets::notice(
             ui,
             Status::Off,
-            "睡眠推定は未校正の暫定ルールです。表示される確率と睡眠時間は、検証済みの値ではありません。",
+            "SleepECG公式GRUの推定は約4〜5分遅延します。HMD静止・装着条件も使いますが、VR利用中の精度は未検証です。",
         );
     }
 
@@ -1129,7 +1139,7 @@ impl Desktop {
         // 横軸は「今日を 0 とした日数」。古い順に並べ、記録の無い日で線を切る。
         let mut by_day: Vec<(f64, &SleepSession)> = sessions
             .iter()
-            .map(|t| (days_ago(t.started_at), *t))
+            .map(|t| (days_ago(sleep_day_timestamp(t)), *t))
             .collect();
         by_day.sort_by(|a, b| a.0.total_cmp(&b.0));
         let series = |value: fn(&SleepSession) -> Option<f64>| {
@@ -1149,7 +1159,13 @@ impl Desktop {
             ui,
             "日ごとの推移",
             |ui| {
-                ui.label(muted(ui, "夜は、セッションを始めた日で数えます"));
+                ui.label(muted(
+                    ui,
+                    format!(
+                        "{}時を区切りに1日1件へ集約。欠測を睡眠時間に加えません",
+                        self.saved.sleep_day_start_hour
+                    ),
+                ));
             },
             |ui| {
                 let group = ui.id().with("history");
@@ -1238,7 +1254,7 @@ impl Desktop {
         let mut open: Option<String> = None;
         widgets::panel(
             ui,
-            "セッション",
+            "日単位の睡眠",
             |ui| {
                 ui.label(muted(ui, "行を選ぶと、その夜を Sleep で開きます"));
             },
@@ -1272,10 +1288,7 @@ impl Desktop {
                 widgets::table_row(ui, &header, true, false, false);
                 for t in &sessions {
                     let (h, m) = hours_minutes(t.estimated_sleep_minutes);
-                    let recording = v
-                        .active
-                        .as_ref()
-                        .is_some_and(|a| a.session_id == t.session_id);
+                    let recording = day_is_active(v, &t.session_id);
                     let state = if t.ended_at.is_some() {
                         Cell::text("完了", w[9]).muted()
                     } else if recording {
@@ -1284,7 +1297,7 @@ impl Desktop {
                         Cell::text("中断", w[9]).warn()
                     };
                     let cells = [
-                        Cell::text(night_label(t.started_at), w[0]),
+                        Cell::text(sleep_day_label(t), w[0]),
                         Cell::number(time(t.started_at), w[1]),
                         Cell::number(time_opt(t.estimated_sleep_at), w[2]),
                         Cell::number(time_opt(t.final_wake_at), w[3]),
@@ -1429,28 +1442,56 @@ impl Desktop {
         });
         widgets::panel(
             ui,
-            "Pulsoid · HRのみ",
+            "HypeRate · HRのみ",
             |ui| {
                 widgets::badge(ui, Status::Off, "WebSocket");
             },
             |ui| {
-                ui.label(muted(ui,"OAuthでPulsoidの心拍読み取りを許可してください。認証トークンは保存・外部公開しません。"));
-                if let Some(auth) = &v.authorization {
-                    ui.label(format!("認証コード: {}", auth.user_code));
-                    ui.hyperlink_to("Pulsoidをブラウザで開いて認証", &auth.verification_uri);
-                    ui.label(muted(
-                        ui,
-                        format!(
-                            "ブラウザで承認後、自動接続します。残り {} 秒",
-                            ((auth.expires_at - shared_types::now_ms()) / 1000).max(0)
-                        ),
-                    ));
-                }
+                ui.label(muted(
+                    ui,
+                    "HypeRate IDとAPIキーで接続します。APIキーは保存・外部公開しません。",
+                ));
+                ui.label(muted(ui, "HypeRate ID"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.hyperate_id)
+                        .hint_text("例: abc123")
+                        .desired_width(ui.available_width()),
+                );
+                ui.label(muted(ui, "APIキー"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.hyperate_key)
+                        .password(true)
+                        .hint_text("HypeRate API key")
+                        .desired_width(ui.available_width()),
+                );
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!s.sensor_connected && !v.connecting && !self.demo,egui::Button::new("PulsoidでOAuth認証" )).clicked() { self.command(Command::AuthorizePulsoid); }
-                    if ui.add_enabled(s.sensor_connected || v.connecting,egui::Button::new("入力を切断 / 認証を中止")).clicked(){self.command(Command::Disconnect);}
-                    ui.hyperlink_to("認証の公式案内","https://docs.pulsoid.net/access-token-management/oauth-2-device-authorization-flow");
+                    if ui
+                        .add_enabled(
+                            !s.sensor_connected
+                                && !v.connecting
+                                && !self.demo
+                                && !self.hyperate_key.trim().is_empty()
+                                && !self.settings.hyperate_id.trim().is_empty(),
+                            egui::Button::new("HypeRateに接続"),
+                        )
+                        .clicked()
+                    {
+                        let key = std::mem::take(&mut self.hyperate_key);
+                        let id = self.settings.hyperate_id.clone();
+                        self.command(Command::ConnectHypeRate { id, key });
+                    }
+                    if ui
+                        .add_enabled(
+                            s.sensor_connected || v.connecting,
+                            egui::Button::new("入力を切断 / 接続を中止"),
+                        )
+                        .clicked()
+                    {
+                        self.command(Command::Disconnect);
+                    }
+                    ui.hyperlink_to("APIキーの公式申請", "https://www.hyperate.io/api.html");
                 });
+                self.save_bar(ui);
             },
         );
         ui.add_space(space::S2);
@@ -1655,18 +1696,25 @@ impl Desktop {
                     widgets::notice(
                         ui,
                         Status::Warn,
-                        "睡眠推定は未校正の暫定ルールです。表示される確率は検証済みの値ではありません。",
+                        "RR睡眠はSleepECG公式GRU（約4〜5分遅延）。VR環境での精度は未検証です。HRのみの擬似判定は別扱いです。",
                     );
-                    widgets::setting_row(ui, "睡眠推定を有効にする", "心拍と HRV から Sleep Probability を計算します", |ui| {
+                    widgets::setting_row(ui, "睡眠推定を有効にする", "RRから公式GRUで推定。モデル未準備時は判定不能になります", |ui| {
                         widgets::toggle(ui, &mut self.settings.sleep_enabled);
                     });
+                    ui.label(muted(ui,"睡眠モデル用Python実行ファイル（専用venvのpython / python.exe）"));
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.sleep_python).desired_width(f32::INFINITY));
+                    let current=self.core.latest();
+                    ui.label(muted(ui,&current.sleep_model.message));
+                    widgets::setting_row(ui,"HMDの静止・装着条件","OpenVR取得不能／未装着／加速度平均0では棄却。OFFでRRモデル単独",|ui|{widgets::toggle(ui,&mut self.settings.sleep_hmd_enabled);});
+                    ui.label(muted(ui,format!("{} · 加速度平均 {} m/s² · 装着 {}",current.hmd.message,opt(current.hmd.acceleration_mean,4),match current.hmd.worn{Some(true)=>"あり",Some(false)=>"なし",None=>"取得不能"})));
+                    widgets::setting_row(ui,"睡眠日の区切り","夜間の分割を避けるため初期値は正午。既存の日付は維持します",|ui|{ui.add(egui::DragValue::new(&mut self.settings.sleep_day_start_hour).range(0..=23).suffix(" 時"));});
                     widgets::setting_row(ui,"自動睡眠記録","RRありの睡眠判定が続いたら記録を開始します",|ui|{widgets::toggle(ui,&mut self.settings.auto_sleep_recording);});
                     widgets::setting_row(ui,"睡眠確定までの時間","擬似睡眠 / RR睡眠の共通条件。60〜1800秒",|ui|{ui.add(egui::DragValue::new(&mut self.settings.sleep_confirm_secs).range(60..=1800).suffix(" 秒"));});
                     widgets::setting_row(ui,"擬似睡眠の基準心拍","HRのみの暫定ルール。初期値60 bpm",|ui|{ui.add(egui::DragValue::new(&mut self.settings.pseudo_sleep_hr).range(35..=100).suffix(" bpm"));});
                     widgets::setting_row(ui, "Baseline の期間", "個人内の変化を比べる基準になる日数です", |ui| {
                         widgets::segmented(ui, &mut self.settings.baseline_days, &[(14, "14日"), (30, "30日")], false);
                     });
-                    widgets::setting_row(ui, "Baseline の状態", "有効な記録が 30 分以上たまると推定を始めます", |ui| {
+                    widgets::setting_row(ui, "Baseline の状態", "グラフの個人平均との差。公式GRUの開始条件とは別です", |ui| {
                         ui.label(muted(ui, "分"));
                         ui.label(RichText::new(grouped(v.baseline.sample_minutes as u64)).text_style(text_style("value")));
                     });
@@ -1698,11 +1746,35 @@ impl Desktop {
                     widgets::setting_row(ui, "API ポート", "1〜65535", |ui| {
                         widgets::text_field(ui, &mut self.api_port, 72.0, true);
                     });
+                    widgets::setting_row(ui,"Web心拍表示","XSOverlay / OVR Toolkitのブラウザ用。REST APIとは別に有効化できます",|ui|{widgets::toggle(ui,&mut self.settings.overlay_enabled);});
+                    let overlay_url=format!("http://127.0.0.1:{}/overlay/heart-rate",self.saved.api_port);
+                    ui.hyperlink_to("心拍Webページを開く",&overlay_url);
+                    ui.label(muted(ui,&overlay_url));
+                    widgets::setting_row(ui,"閉じてもトレイに常駐","計測とWeb配信を継続。トレイメニューの「終了」で保存して停止します",|ui|{widgets::toggle(ui,&mut self.settings.close_to_tray);});
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(self.resident.available(),egui::Button::new("トレイに隠す")).clicked(){self.resident.hide(ui.ctx());}
+                        if ui.button("NemuriBeatを終了").clicked(){self.resident.quit(ui.ctx());}
+                    });
                     widgets::setting_row(ui, "Unix ソケット", "起動時に --ipc で指定します。Windows は準備中です", |ui| {
                         widgets::info(ui, "起動時に指定", false);
                     });
                 },
             );
+            c[1].add_space(space::S2);
+            widgets::panel(&mut c[1], "OyasumiVR", |_| {}, |ui| {
+                widgets::setting_row(ui, "睡眠モードを連携", "NemuriBeatの判定でOyasumiVRの睡眠モードをON/OFFします", |ui| {
+                    widgets::toggle(ui, &mut self.settings.oyasumi_enabled);
+                });
+                widgets::setting_row(ui, "HRのみの擬似判定も送る", "HypeRate等の暫定判定を使用。初期値OFF", |ui| {
+                    widgets::toggle(ui, &mut self.settings.oyasumi_allow_hr_only);
+                });
+                widgets::setting_row(ui, "OSCQueryポート", "0で自動検出。手動の場合はOyasumiVRのOSCQuery受信ポート", |ui| {
+                    ui.add(egui::DragValue::new(&mut self.settings.oyasumi_query_port).range(0..=65535));
+                });
+                ui.label(muted(ui, &v.oyasumi_status));
+                ui.label(muted(ui, "OyasumiVR側のOSCサーバーを有効にしてください。判定不能時は状態を保持します。"));
+                ui.label(muted(ui, "OyasumiVRで設定済みの明るさ・マイク等の自動操作が実行されます。独自の睡眠検出との競合に注意してください。"));
+            });
             c[1].add_space(space::S2);
             widgets::panel(
                 &mut c[1],
@@ -1765,7 +1837,18 @@ impl Desktop {
 
 impl eframe::App for Desktop {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.draw(ctx);
+        let url = format!(
+            "http://127.0.0.1:{}/overlay/heart-rate",
+            self.saved.api_port
+        );
+        if let Some(error) = self.resident.update(ctx, self.saved.close_to_tray, url) {
+            self.notice = error;
+        }
+        if self.resident.visible() {
+            self.draw(ctx);
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 }
 
@@ -2019,10 +2102,41 @@ fn connected(s: &PhysioSnapshot, value: Option<f64>) -> Option<f64> {
 
 /// あるセッションの 1 分足。読み込み中や別のセッションのものは除く。
 fn session_minutes<'a>(v: &'a View, id: &str) -> Vec<&'a FeatureMinute> {
+    let members = v.days.iter().find(|d| d.summary.session_id == id);
     v.history
         .iter()
-        .filter(|m| m.session_id.as_deref() == Some(id))
+        .filter(|m| {
+            m.session_id.as_deref() == Some(id)
+                || members.is_some_and(|d| {
+                    d.segments
+                        .iter()
+                        .any(|s| Some(s.session_id.as_str()) == m.session_id.as_deref())
+                })
+        })
         .collect()
+}
+fn day_is_active(v: &View, id: &str) -> bool {
+    v.active.as_ref().is_some_and(|a| {
+        a.session_id == id
+            || v.days
+                .iter()
+                .find(|d| d.summary.session_id == id)
+                .is_some_and(|d| d.segments.iter().any(|s| s.session_id == a.session_id))
+    })
+}
+fn sleep_day_label(t: &SleepSession) -> String {
+    t.sleep_day
+        .clone()
+        .unwrap_or_else(|| night_label(t.started_at))
+}
+fn sleep_day_timestamp(t: &SleepSession) -> i64 {
+    use chrono::TimeZone;
+    t.sleep_day
+        .as_deref()
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .and_then(|d| d.and_hms_opt(12, 0, 0))
+        .and_then(|d| chrono::Local.from_local_datetime(&d).single())
+        .map_or(t.started_at, |d| d.timestamp_millis())
 }
 
 /// 一晩ぶんの 1 分足。横軸は「始めた日の 0:00 からの分」。
@@ -2126,6 +2240,9 @@ fn osc_state(status: &str) -> (Status, &'static str) {
 /// 編集中の設定と、いま動いている設定で違う項目の数。
 fn changes(a: &Settings, b: &Settings) -> usize {
     [
+        a.oyasumi_enabled != b.oyasumi_enabled,
+        a.oyasumi_allow_hr_only != b.oyasumi_allow_hr_only,
+        a.oyasumi_query_port != b.oyasumi_query_port,
         a.osc_enabled != b.osc_enabled,
         a.oscquery_enabled != b.oscquery_enabled,
         a.osc_host != b.osc_host,
@@ -2135,10 +2252,16 @@ fn changes(a: &Settings, b: &Settings) -> usize {
         a.sleep_enabled != b.sleep_enabled,
         a.baseline_days != b.baseline_days,
         a.api_enabled != b.api_enabled,
+        a.overlay_enabled != b.overlay_enabled,
+        a.close_to_tray != b.close_to_tray,
+        a.hyperate_id != b.hyperate_id,
         a.api_port != b.api_port,
         a.sleep_confirm_secs != b.sleep_confirm_secs,
         a.pseudo_sleep_hr != b.pseudo_sleep_hr,
         a.auto_sleep_recording != b.auto_sleep_recording,
+        a.sleep_python != b.sleep_python,
+        a.sleep_hmd_enabled != b.sleep_hmd_enabled,
+        a.sleep_day_start_hour != b.sleep_day_start_hour,
     ]
     .into_iter()
     .filter(|changed| *changed)
@@ -2324,6 +2447,43 @@ mod tests {
         draft.osc_enabled = true;
         draft.osc_port = 9001;
         assert_eq!(changes(&draft, &saved), 2);
+        draft.oyasumi_enabled = true;
+        draft.oyasumi_allow_hr_only = true;
+        draft.oyasumi_query_port = 12345;
+        assert_eq!(changes(&draft, &saved), 5);
+    }
+    #[test]
+    fn daily_graph_includes_all_segments_and_active_state() {
+        let mut a = sleep_engine::SessionTracker::new(1000).session;
+        a.sleep_day = Some("2026-10-02".into());
+        a.ended_at = Some(2000);
+        let mut b = sleep_engine::SessionTracker::new(3000).session;
+        b.sleep_day = Some("2026-10-02".into());
+        let mut c = sleep_engine::SessionTracker::new(86400000).session;
+        c.sleep_day = Some("2026-10-03".into());
+        let raw = vec![a.clone(), b.clone(), c.clone()];
+        let days = storage::group_sleep_days(&raw, 12);
+        let history = raw
+            .iter()
+            .map(|s| FeatureMinute {
+                timestamp: s.started_at,
+                features: Features::default(),
+                sleep_probability: Some(0.9),
+                session_id: Some(s.session_id.clone()),
+                sample_count: 60,
+            })
+            .collect();
+        let v = View {
+            days,
+            raw_sessions: raw,
+            history,
+            active: Some(b),
+            ..Default::default()
+        };
+        let minutes = session_minutes(&v, "day:2026-10-02");
+        assert_eq!(minutes.len(), 2);
+        assert!(day_is_active(&v, "day:2026-10-02"));
+        assert!(!day_is_active(&v, "day:2026-10-03"));
     }
 
     #[test]

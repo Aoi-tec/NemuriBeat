@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+mod daily;
+pub use daily::{group_sleep_days, sleep_day};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use shared_types::*;
@@ -251,6 +253,20 @@ pub fn sessions(path: &Path, since: i64) -> Result<Vec<SleepSession>> {
     let rows = stmt.query_map([since], |r| r.get::<_, String>(0))?;
     rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
 }
+pub fn sleep_days(path: &Path) -> Result<Vec<DailySleep>> {
+    let hour = settings(path)?.sleep_day_start_hour;
+    Ok(group_sleep_days(&sessions(path, 0)?, hour))
+}
+pub fn day_history(path: &Path, day: &DailySleep) -> Result<Vec<FeatureMinute>> {
+    let mut values = Vec::new();
+    for segment in &day.segments {
+        values.extend(history(path, 0, Some(&segment.session_id))?);
+    }
+    values.sort_by_key(|m| m.timestamp);
+    // A minute reattached during sleep confirmation must not appear twice in a day.
+    values.dedup_by_key(|m| m.timestamp);
+    Ok(values)
+}
 pub fn history(path: &Path, since: i64, session: Option<&str>) -> Result<Vec<FeatureMinute>> {
     let c = read_connection(path)?;
     let mut stmt=c.prepare("SELECT payload FROM physio_features_1m WHERE timestamp>=?1 AND (?2 IS NULL OR session_id=?2) ORDER BY timestamp DESC LIMIT 20160")?;
@@ -482,7 +498,7 @@ mod migration_tests {
                     measurement: Measurement {
                         timestamp: 100,
                         source_timestamp: Some(90),
-                        sensor_id: "Pulsoid".into(),
+                        sensor_id: "HypeRate".into(),
                         heart_rate: 60,
                         rr_ms: vec![],
                         contact: None,

@@ -42,6 +42,10 @@ pub struct SleepEstimate {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PhysioSnapshot {
     #[serde(default)]
+    pub sleep_model: ModelStatus,
+    #[serde(default)]
+    pub hmd: HmdStatus,
+    #[serde(default)]
     pub mode: MeasurementMode,
     #[serde(default)]
     pub rr_available: bool,
@@ -75,6 +79,8 @@ pub struct Baseline {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SleepSession {
+    #[serde(default)]
+    pub sleep_day: Option<String>,
     pub session_id: String,
     pub started_at: i64,
     pub estimated_sleep_at: Option<i64>,
@@ -103,6 +109,12 @@ pub enum Event {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub sleep_python: String,
+    pub sleep_hmd_enabled: bool,
+    pub sleep_day_start_hour: u32,
+    pub oyasumi_enabled: bool,
+    pub oyasumi_allow_hr_only: bool,
+    pub oyasumi_query_port: u16,
     pub osc_enabled: bool,
     pub oscquery_enabled: bool,
     pub osc_host: String,
@@ -112,6 +124,9 @@ pub struct Settings {
     pub sleep_enabled: bool,
     pub baseline_days: u32,
     pub api_enabled: bool,
+    pub overlay_enabled: bool,
+    pub close_to_tray: bool,
+    pub hyperate_id: String,
     pub api_port: u16,
     pub sleep_confirm_secs: u32,
     pub pseudo_sleep_hr: u16,
@@ -120,6 +135,13 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            sleep_python: std::env::var("NEMURIBEAT_PYTHON")
+                .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into()),
+            sleep_hmd_enabled: true,
+            sleep_day_start_hour: 12,
+            oyasumi_enabled: false,
+            oyasumi_allow_hr_only: false,
+            oyasumi_query_port: 0,
             osc_enabled: false,
             oscquery_enabled: true,
             osc_host: "127.0.0.1".into(),
@@ -129,6 +151,9 @@ impl Default for Settings {
             sleep_enabled: true,
             baseline_days: 14,
             api_enabled: false,
+            overlay_enabled: true,
+            close_to_tray: true,
+            hyperate_id: String::new(),
             api_port: 8791,
             sleep_confirm_secs: 300,
             pseudo_sleep_hr: 60,
@@ -138,6 +163,12 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
+        if self.sleep_python.trim().is_empty() || self.sleep_python.contains(['\n', '\r', '\0']) {
+            return Err("睡眠モデル用Pythonの実行ファイルを指定してください".into());
+        }
+        if self.sleep_day_start_hour > 23 {
+            return Err("睡眠日の区切りは0〜23時で指定してください".into());
+        }
         if !(60..=1800).contains(&self.sleep_confirm_secs) {
             return Err("睡眠確定時間は60〜1800秒で指定してください".into());
         }
@@ -155,4 +186,32 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelStatus {
+    pub model: String,
+    pub ready: bool,
+    pub probability: Option<f64>,
+    pub evaluated_at: Option<i64>,
+    pub received_at: Option<i64>,
+    pub message: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HmdStatus {
+    pub timestamp: i64,
+    pub available: bool,
+    pub worn: Option<bool>,
+    pub acceleration_mean: Option<f64>,
+    pub angular_speed_mean: Option<f64>,
+    pub still: bool,
+    pub rejected: bool,
+    pub message: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DailySleep {
+    pub sleep_day: String,
+    pub summary: SleepSession,
+    pub segments: Vec<SleepSession>,
 }

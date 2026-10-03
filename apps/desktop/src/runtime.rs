@@ -1,3 +1,4 @@
+use crate::sleep_workers::{ModelRequest, Workers};
 use anyhow::Result;
 use physio_core::RealtimeCore;
 use sensor_core::{Device, SensorAdapter, SensorMessage};
@@ -16,20 +17,21 @@ pub struct View {
     pub devices: Vec<Device>,
     pub message: String,
     pub sessions: Vec<SleepSession>,
+    pub raw_sessions: Vec<SleepSession>,
+    pub days: Vec<DailySleep>,
     pub history: Vec<FeatureMinute>,
     pub baseline: Baseline,
     pub active: Option<SleepSession>,
     pub display: VecDeque<PhysioSnapshot>,
     pub osc_status: String,
+    pub oyasumi_status: String,
     pub connecting: bool,
-    pub authorization: Option<sensor_pulsoid::oauth::Authorization>,
     pub history_request: u64,
 }
 pub enum Command {
     Scan,
     Connect(String),
-    ConnectPulsoid(String),
-    AuthorizePulsoid,
+    ConnectHypeRate { id: String, key: String },
     Disconnect,
     EndSession,
     Save(Settings),
@@ -78,12 +80,15 @@ pub async fn run(
     ipc_path: Option<String>,
 ) -> Result<()> {
     let (sensor_tx, mut sensor_rx) = mpsc::channel(512);
-    let (auth_tx, mut auth_rx) = mpsc::channel(4);
     let mut adapter: Option<Arc<sensor_ble::GenericBleHRAdapter>> = None;
     let mut sensor_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut sensor_stop: Option<watch::Sender<bool>> = None;
     let (baseline_tx, mut baseline_rx) = mpsc::channel(4);
     let mut sleep = SleepEngine::default();
+    let mut workers = (!demo && settings.sleep_enabled)
+        .then(|| Workers::start(settings.sleep_python.clone(), settings.sleep_hmd_enabled));
+    let mut model_generation = 1u64;
+    let mut last_model_request = 0i64;
     let mut recorder = AutoRecorder::default();
     let mut session: Option<SessionTracker> = None;
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -98,11 +103,13 @@ pub async fn run(
     }
     view.lock().unwrap().baseline = baseline.clone();
     refresh(view.clone(), database.clone(), None);
-    let mut api_task = settings.api_enabled.then(|| {
+    let mut api_task = (settings.api_enabled || settings.overlay_enabled).then(|| {
         start_api(
             core.clone(),
             database.clone(),
             settings.api_port,
+            settings.api_enabled,
+            settings.overlay_enabled,
             view.clone(),
         )
     });
@@ -122,6 +129,7 @@ pub async fn run(
             }
         })
     });
+    let oyasumi = crate::oyasumi::Worker::start(core.subscribe(), settings.clone());
     let mut query: Option<osc_vrchat::QuerySender> = None;
     let mut osc = osc_vrchat::OscSender::new(&settings.osc_host, settings.osc_port).ok();
     let mut events = core.events.subscribe();
@@ -148,43 +156,44 @@ pub async fn run(
            if demo || sensor_task.is_some(){continue;}
            if let Some(a)=adapter.clone(){let (tx,rx)=watch::channel(false);sensor_stop=Some(tx);view.lock().unwrap().connecting=true;sensor_task=Some(spawn_sensor(a,id,sensor_tx.clone(),rx,view.clone()));}
           },
-          Some(Command::AuthorizePulsoid)=>{
-           if demo || sensor_task.is_some(){continue;}
-           let (tx,rx)=watch::channel(false);sensor_stop=Some(tx);view.lock().unwrap().connecting=true;
-           view.lock().unwrap().message="Pulsoid OAuth認証を開始中…".into();
-           sensor_task=Some(spawn_sensor(Arc::new(sensor_pulsoid::oauth::DeviceOAuthAdapter{updates:auth_tx.clone()}),"Pulsoid".into(),sensor_tx.clone(),rx,view.clone()));
-          },
-          Some(Command::ConnectPulsoid(token))=>{
-           if demo || sensor_task.is_some(){view.lock().unwrap().message="先に入力を切断してください（デモではPulsoidを使用できません）".into();continue;}
-           match sensor_pulsoid::PulsoidAdapter::new(token){Ok(a)=>{let (tx,rx)=watch::channel(false);sensor_stop=Some(tx);view.lock().unwrap().connecting=true;view.lock().unwrap().message="Pulsoidへ接続中…".into();sensor_task=Some(spawn_sensor(Arc::new(a),"Pulsoid".into(),sensor_tx.clone(),rx,view.clone()));},Err(e)=>view.lock().unwrap().message=e.to_string()}
+          Some(Command::ConnectHypeRate{id,key})=>{
+           if demo || sensor_task.is_some(){view.lock().unwrap().message="先に入力を切断してください（デモではHypeRateを使用できません）".into();continue;}
+           match sensor_hyperate::HypeRateAdapter::new(id,key){Ok(a)=>{let (tx,rx)=watch::channel(false);sensor_stop=Some(tx);view.lock().unwrap().connecting=true;view.lock().unwrap().message="HypeRateへ接続中…".into();sensor_task=Some(spawn_sensor(Arc::new(a),"HypeRate".into(),sensor_tx.clone(),rx,view.clone()));},Err(e)=>view.lock().unwrap().message=e.to_string()}
           },
           Some(Command::Disconnect)=>{
-           stop_sensor(&mut sensor_stop,&mut sensor_task).await;while sensor_rx.try_recv().is_ok(){}while auth_rx.try_recv().is_ok(){}core.disconnected();sleep=SleepEngine::default();
-           minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now_ms();end_session(&core,&storage,&mut session,now_ms());
-           let mut v=view.lock().unwrap();v.connecting=false;v.authorization=None;v.active=None;v.message="入力を切断しました".into();storage.push(Write::Gap{timestamp:now_ms(),reason:"User disconnected input".into()});
+           model_generation+=1;last_model_request=0;
+           stop_sensor(&mut sensor_stop,&mut sensor_task).await;while sensor_rx.try_recv().is_ok(){}core.disconnected();sleep=SleepEngine::default();
+           minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now_ms();end_session(&core,&storage,&mut session,now_ms(),&view);
+           let mut v=view.lock().unwrap();v.connecting=false;v.active=None;v.message="入力を切断しました".into();storage.push(Write::Gap{timestamp:now_ms(),reason:"User disconnected input".into()});
           },
-          Some(Command::EndSession)=>{minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now_ms();end_session(&core,&storage,&mut session,now_ms());recorder.suppressed=true;view.lock().unwrap().active=None;refresh(view.clone(),database.clone(),None);},
+          Some(Command::EndSession)=>{minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now_ms();end_session(&core,&storage,&mut session,now_ms(),&view);recorder.suppressed=true;view.lock().unwrap().active=None;refresh(view.clone(),database.clone(),None);},
           Some(Command::Save(new))=>{
            if let Err(e)=new.validate(){view.lock().unwrap().message=e;continue;}
            if !storage.push(Write::Settings(new.clone())){view.lock().unwrap().message="設定の保存キューが満杯です".into();continue;}
            if settings.osc_enabled {let off=Settings{osc_enabled:false,..settings.clone()};let _=send_osc(osc.as_ref(),query.as_ref(),&core.latest(),&off,false).await;}
            if let Some(task)=api_task.take(){task.abort();let _=task.await;}
-           if new.api_enabled{api_task=Some(start_api(core.clone(),database.clone(),new.api_port,view.clone()));}
+           if new.api_enabled || new.overlay_enabled{api_task=Some(start_api(core.clone(),database.clone(),new.api_port,new.api_enabled,new.overlay_enabled,view.clone()));}
            osc=osc_vrchat::OscSender::new(&new.osc_host,new.osc_port).ok();
            if settings.sleep_confirm_secs!=new.sleep_confirm_secs || settings.pseudo_sleep_hr!=new.pseudo_sleep_hr || settings.sleep_enabled!=new.sleep_enabled {sleep=SleepEngine::default();}
+           if settings.sleep_python!=new.sleep_python || settings.sleep_hmd_enabled!=new.sleep_hmd_enabled || settings.sleep_enabled!=new.sleep_enabled {
+            if let Some(w)=workers.take(){w.stop().await;}
+            workers=(!demo && new.sleep_enabled).then(||Workers::start(new.sleep_python.clone(),new.sleep_hmd_enabled));
+            model_generation+=1;last_model_request=0;sleep=SleepEngine::default();
+           }
+           oyasumi.configure(new.clone());
            settings=new;
            if !demo{load_baseline(cache_path.clone(),database.clone(),settings.baseline_days,baseline_tx.clone());}
            view.lock().unwrap().message="設定を適用しました（非同期で保存中）".into();
           },
           Some(Command::SelectSession(id))=>refresh(view.clone(),database.clone(),Some(id)),
          },
-         Some(authorization)=auth_rx.recv()=>{view.lock().unwrap().authorization=authorization;},
          Some(result)=baseline_rx.recv()=>match result{Ok((days,b)) if days==settings.baseline_days=>{baseline=b;let _=core.events.send(Event::BaselineUpdated(baseline.clone()));},Ok(_)=>{},Err(e)=>view.lock().unwrap().message=e},
          Some(message)=sensor_rx.recv()=>match message {
-          SensorMessage::Connected(id)=>{core.connected(id);sleep=SleepEngine::default();view.lock().unwrap().message="入力を受信しています".into();},
+          SensorMessage::Connected(id)=>{model_generation+=1;last_model_request=0;core.connected(id);sleep=SleepEngine::default();view.lock().unwrap().message="入力を受信しています".into();},
           SensorMessage::Disconnected(reason)=>{
+           model_generation+=1;last_model_request=0;
            core.disconnected();sleep=SleepEngine::default();storage.push(Write::Gap{timestamp:now_ms(),reason:reason.clone()});view.lock().unwrap().message=reason;
-           minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now_ms();end_session(&core,&storage,&mut session,now_ms());view.lock().unwrap().active=None;
+           minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now_ms();end_session(&core,&storage,&mut session,now_ms(),&view);view.lock().unwrap().active=None;
           },
           SensorMessage::Measurement(m)=>{ingest(&core,&storage,&run_id,&mut minutes,m);},
          },
@@ -198,37 +207,50 @@ pub async fn run(
            if !demo{load_baseline(cache_path.clone(),database.clone(),settings.baseline_days,baseline_tx.clone());}
           }
           if demo {demo_step+=1;let hr=if demo_sleep {50}else{(65.0+8.0*(demo_step as f64/40.0).sin())as u16};ingest(&core,&storage,&run_id,&mut minutes,Measurement{timestamp:now,source_timestamp:None,sensor_id:"DEMO".into(),heart_rate:hr,rr_ms:if demo_hr_only {vec![]}else{vec![60000.0/f64::from(hr)+20.0*(demo_step as f64).sin()]},contact:Some(true)});}
-          if core.expire(now){storage.push(Write::Gap{timestamp:now,reason:"No fresh measurement for 5 seconds".into()});}
+          if core.expire(now){model_generation+=1;last_model_request=0;storage.push(Write::Gap{timestamp:now,reason:"No fresh measurement for 5 seconds".into()});}
           let snapshot=core.latest();
-          if snapshot.mode!=previous_mode {minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now;previous_mode=snapshot.mode;}
+          if snapshot.mode!=previous_mode {model_generation+=1;last_model_request=0;minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now;previous_mode=snapshot.mode;}
           let samples=core.window(now,60000);let mut features=feature_engine::calculate(&samples,now,&baseline);
+          if let Some(w)=&workers {if snapshot.mode==MeasurementMode::HrRr && snapshot.sensor_connected && now-last_model_request>=30000 {
+           w.request(ModelRequest{generation:model_generation,measurements:core.window(now,20*60000)});last_model_request=now;
+          }}
+          let (model,hmd)=workers.as_ref().map(|w|w.latest(model_generation)).unwrap_or_default();
           let estimate=if snapshot.mode==MeasurementMode::HrOnly {
            features.rmssd=None;features.sdnn=None;features.pnn50=None;features.valid_rr=0;
            let valid_hr=snapshot.sensor_connected && samples.last().is_some_and(|m|m.contact!=Some(false)&&(25..=240).contains(&m.heart_rate));
            features.quality=if valid_hr{1.0}else{0.0};
-           sleep.update_hr_only(&features,valid_hr,settings.sleep_enabled,now,settings.pseudo_sleep_hr,settings.sleep_confirm_secs)
-          }else {sleep.update_configured(&features,&baseline,snapshot.sensor_connected,settings.sleep_enabled,now,settings.sleep_confirm_secs)};
+           let eligible=demo || sleep_engine::hmd_eligible(&hmd,settings.sleep_hmd_enabled,now);
+           let stationary=demo || !settings.sleep_hmd_enabled || hmd.still;
+           sleep.update_hr_only(&features,valid_hr&&eligible&&stationary,settings.sleep_enabled,now,settings.pseudo_sleep_hr,settings.sleep_confirm_secs)
+          }else if demo {sleep.update_configured(&features,&baseline,snapshot.sensor_connected,settings.sleep_enabled,now,settings.sleep_confirm_secs)}
+          else {sleep.update_model(&features,&model,&hmd,&settings,snapshot.sensor_connected,now)};
           // Only RR-based minute scores enter sleep history/baseline; HR-only output is ephemeral.
           if estimate.tracking && snapshot.mode==MeasurementMode::HrRr{minutes.probabilities.push(estimate.probability);}
-          core.set_analysis(features,estimate);let latest=core.latest();
+          core.set_sleep_context(model,hmd);core.set_analysis(features,estimate);let latest=core.latest();
           match recorder.decide(&latest,session.is_some(),settings.auto_sleep_recording) {
            RecordingAction::Start=>{
             minutes.flush(&storage,&cache,&baseline,None);
             let since=sleep.confirmed_since.unwrap_or(now);let mut tracker=SessionTracker::new(since);
+            tracker.session.sleep_day=Some(storage::sleep_day(since,settings.sleep_day_start_hour));
             tracker.session.estimated_sleep_at=Some(since);tracker.session.estimated_sleep_minutes=(now-since).max(0)as f64/60000.0;
             for minute in &minutes.recent {if minute.features.timestamp>=since {let mut minute=minute.clone();minute.session_id=Some(tracker.session.session_id.clone());tracker.add_minute(&minute);storage.push(Write::Minute(minute));}}
             storage.push(Write::Session(tracker.session.clone()));let _=core.events.send(Event::SleepSessionStarted(tracker.session.session_id.clone()));
             session=Some(tracker);minutes.started=now;view.lock().unwrap().message="睡眠の継続を確認し、自動記録を開始しました".into();
            },
-           RecordingAction::Stop=>{minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now;end_session(&core,&storage,&mut session,now);refresh(view.clone(),database.clone(),None);},
+           RecordingAction::Stop=>{minutes.flush(&storage,&cache,&baseline,session.as_mut());minutes.started=now;end_session(&core,&storage,&mut session,now,&view);refresh(view.clone(),database.clone(),None);},
            RecordingAction::None=>{}
           }
           if let Some(t)=&mut session{t.update(&latest,now);storage.push(Write::Session(t.session.clone()));}
-          let mut v=view.lock().unwrap();v.baseline=baseline.clone();v.active=session.as_ref().map(|s|s.session.clone());v.display.push_back(PhysioSnapshot{timestamp:now,..latest});while v.display.len()>1805 {v.display.pop_front();}
+          let mut v=view.lock().unwrap();v.baseline=baseline.clone();v.active=session.as_ref().map(|s|s.session.clone());
+          if let Some(active)=v.active.clone(){v.raw_sessions.retain(|s|s.session_id!=active.session_id);v.raw_sessions.push(active);}
+          v.days=storage::group_sleep_days(&v.raw_sessions,settings.sleep_day_start_hour);
+          v.sessions=v.days.iter().map(|d|d.summary.clone()).collect();
+          v.display.push_back(PhysioSnapshot{timestamp:now,..latest});while v.display.len()>1805 {v.display.pop_front();}
           if let Some(error)=storage.health.error.lock().unwrap().clone(){let _=core.events.send(Event::StorageError(error));}
           if let Some(error)=cache.health.error.lock().unwrap().clone(){v.message=format!("Cache保存を再試行中: {error}");}
          },
          _=osc_tick.tick()=>{
+          view.lock().unwrap().oyasumi_status=oyasumi.status();
           if settings.osc_enabled && settings.oscquery_enabled && query.is_none(){
            match osc_vrchat::QuerySender::new().await{Ok(q)=>query=Some(q),Err(e)=>{view.lock().unwrap().osc_status=format!("OSC error: OSCQuery initialization: {e}");continue;}}
           }
@@ -240,14 +262,18 @@ pub async fn run(
          }
         }
     }
+    oyasumi.stop().await;
     stop_sensor(&mut sensor_stop, &mut sensor_task).await;
+    if let Some(w) = workers.take() {
+        w.stop().await;
+    }
     while let Ok(message) = sensor_rx.try_recv() {
         if let SensorMessage::Measurement(m) = message {
             ingest(&core, &storage, &run_id, &mut minutes, m);
         }
     }
     minutes.flush(&storage, &cache, &baseline, session.as_mut());
-    end_session(&core, &storage, &mut session, now_ms());
+    end_session(&core, &storage, &mut session, now_ms(), &view);
     core.disconnected();
     let _ = send_osc(
         osc.as_ref(),
@@ -349,9 +375,17 @@ fn end_session(
     storage: &Storage,
     session: &mut Option<SessionTracker>,
     now: i64,
+    view: &Arc<Mutex<View>>,
 ) {
     if let Some(mut t) = session.take() {
+        t.update(&core.latest(), now);
         t.end(now);
+        let mut v = view.lock().unwrap();
+        v.raw_sessions
+            .retain(|s| s.session_id != t.session.session_id);
+        v.raw_sessions.push(t.session.clone());
+        v.active = None;
+        drop(v);
         storage.push(Write::Session(t.session.clone()));
         let _ = core
             .events
@@ -394,10 +428,14 @@ fn start_api(
     core: RealtimeCore,
     database: PathBuf,
     port: u16,
+    full_api: bool,
+    overlay: bool,
     view: Arc<Mutex<View>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = api::serve(api::ApiState { core, database }, port).await {
+        if let Err(e) =
+            api::serve_with_options(api::ApiState { core, database }, port, full_api, overlay).await
+        {
             view.lock().unwrap().message = format!("API: {e}");
         }
     })
@@ -410,14 +448,25 @@ fn refresh(view: Arc<Mutex<View>>, path: PathBuf, id: Option<String>) {
     };
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || -> Result<_> {
-            let sessions = storage::sessions(&path, 0)?;
+            let raw_sessions = storage::sessions(&path, 0)?;
+            let groups = storage::group_sleep_days(
+                &raw_sessions,
+                storage::settings(&path)?.sleep_day_start_hour,
+            );
+            let sessions: Vec<_> = groups.iter().map(|d| d.summary.clone()).collect();
             let id = id.or_else(|| sessions.first().map(|s| s.session_id.clone()));
             let history = if let Some(id) = id {
-                storage::history(&path, 0, Some(&id))?
+                if let Some(group) = groups.iter().find(|d| {
+                    d.summary.session_id == id || d.segments.iter().any(|s| s.session_id == id)
+                }) {
+                    storage::day_history(&path, group)?
+                } else {
+                    vec![]
+                }
             } else {
                 vec![]
             };
-            Ok((sessions, history))
+            Ok((raw_sessions, groups, sessions, history))
         })
         .await;
         let mut v = view.lock().unwrap();
@@ -425,7 +474,27 @@ fn refresh(view: Arc<Mutex<View>>, path: PathBuf, id: Option<String>) {
             return;
         }
         match result {
-            Ok(Ok((sessions, history))) => {
+            Ok(Ok((raw_sessions, days, sessions, history))) => {
+                let mut merged = raw_sessions;
+                // A read can race the bounded asynchronous DB writer. Keep newer live values.
+                for recent in &v.raw_sessions {
+                    if let Some(old) = merged
+                        .iter_mut()
+                        .find(|s| s.session_id == recent.session_id)
+                    {
+                        if recent.estimated_sleep_minutes > old.estimated_sleep_minutes
+                            || (recent.ended_at.is_some() && old.ended_at.is_none())
+                        {
+                            *old = recent.clone();
+                        }
+                    } else {
+                        merged.push(recent.clone());
+                    }
+                }
+                merged.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+                merged.truncate(10000);
+                v.raw_sessions = merged;
+                v.days = days;
                 v.sessions = sessions;
                 v.history = history;
             }

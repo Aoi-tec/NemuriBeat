@@ -54,8 +54,11 @@ with tempfile.TemporaryDirectory(prefix='nemuri-query-') as tmp:
     threading.Thread(target=query.serve_forever, daemon=True).start()
     db = sqlite3.connect(personal)
     db.executescript((REPO / 'migrations/001_initial.sql').read_text())
+    with socket.socket() as reservation:
+        reservation.bind(('127.0.0.1',0))
+        api_port=reservation.getsockname()[1]
     db.execute("INSERT INTO settings VALUES ('app',?,0)", [json.dumps({
-        'osc_enabled': True, 'oscquery_enabled': True,
+        'osc_enabled': True, 'oscquery_enabled': True, 'api_port':api_port,
         'osc_port': decoy.getsockname()[1]})])
     db.commit()
     process = subprocess.Popen([BINARY, '--demo', '--headless', '--seconds', '24', '--data-dir', str(root)],

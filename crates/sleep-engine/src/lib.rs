@@ -9,6 +9,49 @@ pub struct SleepEngine {
     pub confirmed_since: Option<i64>,
 }
 impl SleepEngine {
+    /// Official model output with quality, freshness, and optional HMD evidence gates.
+    pub fn update_model(
+        &mut self,
+        f: &Features,
+        model: &ModelStatus,
+        hmd: &HmdStatus,
+        settings: &Settings,
+        connected: bool,
+        now: i64,
+    ) -> SleepEstimate {
+        if self.last_mode != MeasurementMode::HrRr {
+            *self = Self::default();
+            self.last_mode = MeasurementMode::HrRr;
+        }
+        let fresh = model
+            .received_at
+            .is_some_and(|t| (0..=90000).contains(&(now - t)));
+        let target_valid = model
+            .evaluated_at
+            .is_some_and(|t| (0..=360000).contains(&(now - t)));
+        let valid = model
+            .probability
+            .is_some_and(|p| p.is_finite() && (0.0..=1.0).contains(&p));
+        if !settings.sleep_enabled
+            || !connected
+            || f.quality < 0.8
+            || f.valid_rr < 30
+            || !model.ready
+            || !fresh
+            || !target_valid
+            || !valid
+            || !hmd_eligible(hmd, settings.sleep_hmd_enabled, now)
+        {
+            *self = Self::default();
+            return SleepEstimate::default();
+        }
+        let raw = if settings.sleep_hmd_enabled && !hmd.still {
+            model.probability.unwrap().min(0.1)
+        } else {
+            model.probability.unwrap()
+        };
+        self.smooth(raw, now, settings.sleep_confirm_secs)
+    }
     /// Experimental heuristic, not a trained or calibrated probability model.
     pub fn update(
         &mut self,
@@ -120,6 +163,14 @@ impl SleepEngine {
         }
     }
 }
+pub fn hmd_eligible(hmd: &HmdStatus, enabled: bool, now: i64) -> bool {
+    !enabled
+        || (hmd.available
+            && (0..=2000).contains(&(now - hmd.timestamp))
+            && hmd.worn != Some(false)
+            && !hmd.rejected
+            && hmd.acceleration_mean.is_some())
+}
 pub struct SessionTracker {
     pub session: SleepSession,
     last: i64,
@@ -133,6 +184,7 @@ impl SessionTracker {
     pub fn new(now: i64) -> Self {
         Self {
             session: SleepSession {
+                sleep_day: None,
                 session_id: uuid::Uuid::new_v4().to_string(),
                 started_at: now,
                 estimated_sleep_at: None,
@@ -339,5 +391,126 @@ mod mode_tests {
         assert_eq!(t.rmssd_histogram.len(), 2001);
         assert_eq!(t.session.avg_hr, Some(50.0));
         assert_eq!(t.session.median_rmssd, Some(45.0));
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+    #[test]
+    fn model_can_confirm_without_personal_baseline_and_stale_model_is_unknown() {
+        let settings = Settings {
+            sleep_confirm_secs: 60,
+            sleep_hmd_enabled: false,
+            ..Default::default()
+        };
+        let f = Features {
+            quality: 1.0,
+            valid_rr: 60,
+            ..Default::default()
+        };
+        let mut engine = SleepEngine::default();
+        let mut model = ModelStatus {
+            ready: true,
+            probability: Some(0.95),
+            evaluated_at: Some(0),
+            received_at: Some(0),
+            ..Default::default()
+        };
+        for now in 0..60 {
+            assert!(
+                !engine
+                    .update_model(
+                        &f,
+                        &model,
+                        &HmdStatus::default(),
+                        &settings,
+                        true,
+                        now * 1000
+                    )
+                    .sleep_like
+            );
+        }
+        assert!(
+            engine
+                .update_model(&f, &model, &HmdStatus::default(), &settings, true, 60000)
+                .sleep_like
+        );
+        assert!(
+            !engine
+                .update_model(&f, &model, &HmdStatus::default(), &settings, true, 91000)
+                .tracking
+        );
+        model.received_at = Some(92000);
+        model.probability = Some(f64::NAN);
+        assert!(
+            !engine
+                .update_model(&f, &model, &HmdStatus::default(), &settings, true, 92000)
+                .tracking
+        );
+    }
+    #[test]
+    fn removed_or_zero_hmd_is_unknown_and_motion_prevents_sleep() {
+        let settings = Settings {
+            sleep_confirm_secs: 60,
+            ..Default::default()
+        };
+        let f = Features {
+            quality: 1.0,
+            valid_rr: 60,
+            ..Default::default()
+        };
+        let mut engine = SleepEngine::default();
+        for i in 0..65 {
+            let now = i * 1000;
+            let model = ModelStatus {
+                ready: true,
+                probability: Some(0.99),
+                evaluated_at: Some(now),
+                received_at: Some(now),
+                ..Default::default()
+            };
+            let hmd = HmdStatus {
+                timestamp: now,
+                available: true,
+                worn: Some(true),
+                still: false,
+                acceleration_mean: Some(0.2),
+                ..Default::default()
+            };
+            let s = engine.update_model(&f, &model, &hmd, &settings, true, now);
+            assert!(s.tracking);
+            assert!(!s.sleep_like);
+        }
+        let model = ModelStatus {
+            ready: true,
+            probability: Some(0.99),
+            evaluated_at: Some(65000),
+            received_at: Some(65000),
+            ..Default::default()
+        };
+        for hmd in [
+            HmdStatus::default(),
+            HmdStatus {
+                timestamp: 65000,
+                available: true,
+                worn: Some(false),
+                acceleration_mean: Some(0.01),
+                ..Default::default()
+            },
+            HmdStatus {
+                timestamp: 65000,
+                available: true,
+                rejected: true,
+                acceleration_mean: Some(0.0),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                !engine
+                    .update_model(&f, &model, &hmd, &settings, true, 65000)
+                    .tracking
+            );
+        }
     }
 }

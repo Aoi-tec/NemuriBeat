@@ -17,18 +17,28 @@ ipc = { path = "../../crates/ipc" }
 anyhow.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui_plot = "0.34"
 rosc = "0.11"
+vrchat_osc = "2.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 uuid.workspace = true
 directories = "6"
 chrono = "0.4"
 
-sensor-pulsoid = { path = "../../crates/sensor-pulsoid" }
+sensor-hyperate = { path = "../../crates/sensor-hyperate" }
 
 [build-dependencies]
 winresource = "0.1"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = "0.26"
+
+[dev-dependencies]
+axum = "0.8"

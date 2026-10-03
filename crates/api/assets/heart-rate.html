@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NemuriBeat · Heart Rate</title><link rel="icon" href="/overlay/icon.png"><link rel="stylesheet" href="/overlay/heart-rate.css"><script defer src="/overlay/heart-rate.js"></script></head>
+<body><main class="card" aria-label="NemuriBeat 心拍表示">
+<canvas id="trace" class="trace" aria-hidden="true"></canvas>
+<header><img src="/overlay/icon.png" alt="" width="40" height="40"><span>NemuriBeat</span><span id="source">WAITING</span></header>
+<div class="pulse"><span class="heart" aria-hidden="true">♥</span><output id="bpm" aria-label="心拍数">—</output><span class="unit">BPM</span></div>
+<div class="status"><span id="connection" role="status">心拍の受信待ち</span><span id="sleep">判定待ち</span></div>
+<footer><span id="mode">HR</span><span id="age">NemuriBeatを起動してセンサーを接続</span></footer>
+<div class="trace-note">BPMから生成した擬似波形</div>
+</main></body></html>

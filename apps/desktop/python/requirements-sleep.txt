@@ -1,0 +1,5 @@
+# Python 3.12; install into a dedicated virtual environment, not a system Python.
+sleepecg==0.5.9
+tensorflow==2.16.2
+keras==3.15.1
+openvr==2.12.1401
