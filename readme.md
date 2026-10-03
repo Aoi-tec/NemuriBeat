@@ -132,3 +132,4 @@ smokeはHR＋RRとHRのみの96秒テストを同時実行します。実機・P
 ## ロゴ
 
 指定のnemuribeat-moon-pulse-v0.4を `apps/desktop/assets/branding` に同梱。eguiウィンドウアイコン、サイドバー、Windows EXEリソース、macOSバンドルのICNSに反映。Windowsのアイコン埋め込みにはMSVC付属のリソースコンパイラが必要です。
+# VRC-Health-Check
